@@ -1,0 +1,3 @@
+# Roadmap
+
+The canonical five-phase plan and acceptance criteria are in [docs/ROADMAP.md](docs/ROADMAP.md). Phase 2 static Go evidence, Phase 3A, Phase 3B.1 bounded mutation testing, and Phase 3B.2 bounded test-contribution evidence are accepted with documented limitations; see their acceptance decisions in [docs/ROADMAP.md](docs/ROADMAP.md). Phase 4A implements the static-only Pi `/brag` and `/brag all` extension; further Phase 4 reasoning work and Phase 5 remain unimplemented. See [Phase 4 readiness and boundaries](docs/PHASE4-READINESS.md) and the [Phase 3B.2 acceptance decision](docs/ROADMAP.md#phase-3b2-acceptance-decision).
