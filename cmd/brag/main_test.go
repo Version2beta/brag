@@ -167,14 +167,14 @@ func TestWait(t *testing.T) { time.Sleep(5*time.Second) }
 	}
 	defer os.RemoveAll(dir)
 	r := executeDynamic(context.Background(), dir, privateTempDir(t), "timeout", identity, 100*time.Millisecond, 0, &artifactBudget{})
-	if r.Status != "timeout" {
+	if r.Status != "timeout" || r.Classification != "run_timeout" {
 		t.Fatalf("per-run timeout not reported: %+v", r)
 	}
-	totalCtx, cancelTotal := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	totalCtx, cancelTotal := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
 	totalTimeout := executeDynamic(totalCtx, dir, privateTempDir(t), "total-timeout", identity, 10*time.Second, 0, &artifactBudget{})
 	cancelTotal()
-	if totalTimeout.Status != "timeout" || totalTimeout.Classification != "total_timeout" {
-		t.Fatalf("total timeout not reported: %+v", totalTimeout)
+	if totalTimeout.Status != "timeout" || totalTimeout.Classification != "total_timeout" || totalTimeout.Coverage.Status != "unavailable" {
+		t.Fatalf("total timeout without coverage artifact not reported: %+v", totalTimeout)
 	}
 	exact := &cappedOutput{limit: 4}
 	_, _ = exact.Write([]byte("1234"))
@@ -521,11 +521,11 @@ func TestReachableScopeIdentityOverlayDeterminism(t *testing.T) {
 	os.WriteFile(filepath.Join(d, "secret"), []byte("sensitive-no-read"), 0600)
 	sub := filepath.Join(d, "sub")
 	os.Mkdir(sub, 0700)
-	one, e := run(t, sub, "--base", base)
+	one, e := run(t, sub, "--base", base, "--selected", "Ada=ada@example.test")
 	if e != nil {
 		t.Fatal(e)
 	}
-	two, e := run(t, sub, "--base", base)
+	two, e := run(t, sub, "--base", base, "--selected", "Ada=ada@example.test")
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -548,8 +548,8 @@ func TestReachableScopeIdentityOverlayDeterminism(t *testing.T) {
 	if r.NetSourceChange == nil || r.NetSourceChange.Status != "available" || r.NetSourceChange.Baseline != "pinned merge-base "+base {
 		t.Fatalf("net source snapshot: %+v", r.NetSourceChange)
 	}
-	if r.SelectedContributor.AuthorCommitRatio.Numerator != 2 || r.SelectedContributor.AuthorCommitRatio.Denominator != 2 {
-		t.Fatalf("ratio=%+v", r.SelectedContributor.AuthorCommitRatio)
+	if r.SelectedContributor.AuthorCommitRatio.Numerator != 2 || r.SelectedContributor.AuthorCommitRatio.Denominator != 2 || r.RepositoryMeasures.CommitCount != 2 {
+		t.Fatalf("developer/repository commit ratio=%+v repository=%+v", r.SelectedContributor.AuthorCommitRatio, r.RepositoryMeasures)
 	}
 	if r.WorkingTree.TrackedPathsChanged != 4 || !r.WorkingTree.UntrackedFilesPresent {
 		t.Fatalf("overlay=%+v", r.WorkingTree)
@@ -585,6 +585,9 @@ func TestUpstreamAndExplicitBaseAndEmptyScopes(t *testing.T) {
 		t.Fatal(e)
 	}
 	allReport := decode(t, all)
+	if allReport.ToolVersion != "v0.1.0-rc.1" {
+		t.Fatalf("tool_version = %q, want release v0.1.0-rc.1", allReport.ToolVersion)
+	}
 	if len(allReport.History.IncludedCommitIDs) != 2 {
 		t.Fatal("all scope not reachable HEAD history")
 	}
@@ -623,6 +626,35 @@ func TestUpstreamAndExplicitBaseAndEmptyScopes(t *testing.T) {
 		t.Fatalf("empty repository all scope: %v", e)
 	}
 }
+func TestUnknownSelectedIdentityDoesNotAttributeHistoryOrWorktree(t *testing.T) {
+	d, _ := mkRepo(t)
+	if err := os.WriteFile(filepath.Join(d, "app.go"), []byte("package app\nfunc Unattributed() {}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "untracked.go"), []byte("package app\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, d, "all", "--selected", "Unknown=unknown@example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := decode(t, out)
+	if !r.SelectedIdentity.Available || r.SelectedIdentity.Email != "unknown@example.test" || r.SelectedContributor == nil {
+		t.Fatalf("explicit unknown identity was not preserved: %+v", r.SelectedIdentity)
+	}
+	if r.RepositoryMeasures.CommitCount != 1 || r.SelectedContributor.AuthorCommits != 0 || r.SelectedContributor.CoauthorCommits != 0 || r.SelectedContributor.AuthorCommitRatio.Numerator != 0 || r.SelectedContributor.AuthorCommitRatio.Denominator != 1 {
+		t.Fatalf("unknown identity received fabricated history: selected=%+v repository=%+v", r.SelectedContributor, r.RepositoryMeasures)
+	}
+	for _, contributor := range r.Contributors {
+		if strings.EqualFold(contributor.Email, "unknown@example.test") {
+			t.Fatalf("unknown identity was inserted into history contributors: %+v", contributor)
+		}
+	}
+	if r.SelectedContributor.CumulativeChurn != (Counts{}) || r.WorkingTree.Counts.LinesAdded == 0 || !r.WorkingTree.UntrackedFilesPresent {
+		t.Fatalf("uncommitted changes were attributed or hidden: selected=%+v overlay=%+v", r.SelectedContributor, r.WorkingTree)
+	}
+}
+
 func TestEmailCanonicalizationAndStateIdentity(t *testing.T) {
 	d, base := mkRepo(t)
 	gitCmd(t, d, "-c", "user.name=Zed", "-c", "user.email=ada@example.test", "commit", "--allow-empty", "-qm", "second name")

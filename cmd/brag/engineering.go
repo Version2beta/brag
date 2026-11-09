@@ -150,6 +150,8 @@ type functionMap map[string]functionInfo
 type snapshotInput struct {
 	label, rev string
 	overlay    bool
+	reader     *gitBatchReader
+	contents   map[string][]byte
 }
 
 func buildEngineeringEvidence(scope, head string, base *baseInfo, root string, commits []string, selected identityInfo, identities maps) engineeringEvidence {
@@ -166,9 +168,21 @@ func buildEngineeringEvidence(scope, head string, base *baseInfo, root string, c
 	}
 	inputs := []snapshotInput{}
 	if scope == "branch" && base != nil {
-		inputs = append(inputs, snapshotInput{"baseline", base.MergeBase, false})
+		inputs = append(inputs, snapshotInput{label: "baseline", rev: base.MergeBase})
 	}
-	inputs = append(inputs, snapshotInput{"HEAD", head, false}, snapshotInput{"current_tracked_worktree", head, true})
+	inputs = append(inputs, snapshotInput{label: "HEAD", rev: head}, snapshotInput{label: "current_tracked_worktree", rev: head, overlay: true})
+	batchReaders := []*gitBatchReader{}
+	for i := range inputs {
+		if inputs[i].overlay {
+			continue
+		}
+		inputs[i].contents = map[string][]byte{}
+		reader, err := newGitBatchReaderForCommit(root, inputs[i].rev)
+		if err == nil {
+			inputs[i].reader = reader
+			batchReaders = append(batchReaders, reader)
+		}
+	}
 	maps := []functionMap{}
 	bad := false
 	for _, in := range inputs {
@@ -192,8 +206,47 @@ func buildEngineeringEvidence(scope, head string, base *baseInfo, root string, c
 	out.Documentation = buildDocumentationEvidence(root, inputs)
 	out.Architecture = buildArchitectureEvidence(root, inputs)
 	out.Security = buildSecurityEvidence(root, inputs)
+	for _, reader := range batchReaders {
+		if err := reader.Close(); err != nil {
+			markEngineeringEvidencePartial(&out, "Git batch reader did not close cleanly; one or more committed snapshot objects may be incomplete")
+		}
+	}
 	return out
 }
+
+func markEngineeringEvidencePartial(e *engineeringEvidence, reason string) {
+	mark := func(status *string) {
+		if *status == "measured" {
+			*status = "partial"
+		}
+	}
+	mark(&e.Complexity.Status)
+	for i := range e.Complexity.Snapshots {
+		mark(&e.Complexity.Snapshots[i].Status)
+	}
+	mark(&e.TestInventory.Status)
+	for i := range e.TestInventory.Snapshots {
+		mark(&e.TestInventory.Snapshots[i].Status)
+	}
+	mark(&e.Documentation.Status)
+	for i := range e.Documentation.Snapshots {
+		mark(&e.Documentation.Snapshots[i].Status)
+	}
+	mark(&e.Architecture.Status)
+	for i := range e.Architecture.Snapshots {
+		mark(&e.Architecture.Snapshots[i].Status)
+	}
+	mark(&e.Security.Status)
+	for i := range e.Security.Snapshots {
+		mark(&e.Security.Snapshots[i].Status)
+	}
+	e.Complexity.Limitations = append(e.Complexity.Limitations, reason)
+	e.TestInventory.Limitations = append(e.TestInventory.Limitations, reason)
+	e.Documentation.Limitations = append(e.Documentation.Limitations, reason)
+	e.Architecture.Limitations = append(e.Architecture.Limitations, reason)
+	e.Security.Limitations = append(e.Security.Limitations, reason)
+}
+
 func runGit(root string, args ...string) ([]byte, error) {
 	c := exec.Command("git", append([]string{"-C", root}, args...)...)
 	c.Env = gitEnvironment(os.Environ())
@@ -252,6 +305,24 @@ func readSnapshotFile(root string, in snapshotInput, path, hash, mode string, to
 	}
 	if mode != "100644" && mode != "100755" {
 		return nil, false, true
+	}
+	if in.reader != nil {
+		kind, size, err := in.reader.Info(hash)
+		if err != nil || kind != "blob" || size > complexityFileBytes || total+size > complexityTotalBytes {
+			return nil, false, true
+		}
+		if content, ok := in.contents[hash]; ok {
+			if len(content) != size {
+				return nil, false, true
+			}
+			return content, true, false
+		}
+		kind, content, size, err := in.reader.Read(hash, complexityFileBytes)
+		if err != nil || kind != "blob" || len(content) != size || total+size > complexityTotalBytes {
+			return nil, false, true
+		}
+		in.contents[hash] = content
+		return content, true, false
 	}
 	sz, e := runGit(root, "cat-file", "-s", hash)
 	n, pe := strconv.Atoi(strings.TrimSpace(string(sz)))

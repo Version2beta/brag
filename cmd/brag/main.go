@@ -305,44 +305,13 @@ func main() {
 	if hs != "" {
 		commits = strings.Split(hs, "\n")
 	}
-	by := map[string]*Person{}
-	all := Counts{}
-	authored, coauthored := 0, 0
-	for _, h := range commits {
-		m, e := git("show", "-s", "--format=%an%x00%ae%x00%B", h)
-		if e != nil {
-			die(e)
-		}
-		p := strings.SplitN(string(m), "\x00", 3)
-		if len(p) < 3 {
-			continue
-		}
-		author := resolve(identityInfo{Name: p[0], Email: p[1], Available: true}, cm)
-		x := getPerson(by, author)
-		x.AuthorCommits++
-		authored++
-		seen := map[string]bool{}
-		for _, c := range parseCoauthors(p[2]) {
-			c = resolve(c, cm)
-			k := idKey(c)
-			if seen[k] {
-				continue
-			}
-			seen[k] = true
-			getPerson(by, c).CoauthorCommits++
-			coauthored++
-		}
-		n, e := git("diff-tree", "--no-ext-diff", "--no-textconv", "--root", "--no-commit-id", "--numstat", "-r", "-M", h)
-		if e != nil {
-			die(e)
-		}
-		a := sum(n)
-		all = add(all, a)
-		x.LinesAdded += a.LinesAdded
-		x.LinesDeleted += a.LinesDeleted
-		x.SourceLinesAdded += a.SourceLinesAdded
-		x.SourceLinesDeleted += a.SourceLinesDeleted
+	history, e := collectHistory(repo, revs, commits, cm)
+	if e != nil {
+		die(e)
 	}
+	by := history.people
+	all := history.churn
+	authored, coauthored := history.authored, history.coauthored
 	list := make([]Person, 0, len(by))
 	for _, p := range by {
 		list = append(list, *p)
@@ -389,7 +358,7 @@ func main() {
 	if me.Available {
 		delete(un, "selected_contributor_metrics")
 	}
-	r := report{SchemaVersion: reportSchemaVersion, ToolVersion: "1.0.0", ConfigVersion: 1, Repository: ".", Scope: scope, Head: head, Base: base, History: historyInfo{commits, boundary}, SelectedIdentity: me, WorkingTreeStateID: stateID, WorkingTreeStateMethod: stateMethod, Attribution: attribution{authored, coauthored}, Contributors: list, RepositoryMeasures: repositoryMeasures{CommitCount: len(commits), ContributorCount: len(list), CumulativeChurn: all}, NetSourceChange: net, SelectedContributor: sel, Measures: measureInfo{"Git per-commit numstat; line churn belongs to commit author; coauthor counts are separate and can overlap author counts; merges use combined-diff default and may omit merge changes; binaries excluded", "tracked final index/worktree diff against HEAD exactly once; staged and unstaged changes coalesce; untracked contents excluded", "author commits / all included commits; coauthor counts are not added to this denominator", sourceExts()}, WorkingTree: ov, Unavailable: un, Warnings: warns}
+	r := report{SchemaVersion: reportSchemaVersion, ToolVersion: "v0.1.0-rc.1", ConfigVersion: 1, Repository: ".", Scope: scope, Head: head, Base: base, History: historyInfo{commits, boundary}, SelectedIdentity: me, WorkingTreeStateID: stateID, WorkingTreeStateMethod: stateMethod, Attribution: attribution{authored, coauthored}, Contributors: list, RepositoryMeasures: repositoryMeasures{CommitCount: len(commits), ContributorCount: len(list), CumulativeChurn: all}, NetSourceChange: net, SelectedContributor: sel, Measures: measureInfo{"Git per-commit numstat; line churn belongs to commit author; coauthor counts are separate and can overlap author counts; merges use combined-diff default and may omit merge changes; binaries excluded", "tracked final index/worktree diff against HEAD exactly once; staged and unstaged changes coalesce; untracked contents excluded", "author commits / all included commits; coauthor counts are not added to this denominator", sourceExts()}, WorkingTree: ov, Unavailable: un, Warnings: warns}
 	r.EngineeringEvidence = buildEngineeringEvidence(scope, head, base, repo, commits, me, cm)
 	if *mutationArg && *dynamicArg {
 		die(errors.New("--mutation-tests and --dynamic-tests cannot be combined"))

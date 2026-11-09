@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -34,15 +36,42 @@ func applyHistoricalTestAttribution(e testEvidence, root string, commits []strin
 		r.Reason = "commit analysis cap exceeded"
 		commits = commits[:historicalCommitLimit]
 	}
+	parentMap, parentErr := historyParentMap(root, commits)
+	if parentErr != nil {
+		r.Partial = true
+		r.Reason = "commit parent metadata unavailable"
+	}
+	authorMap, authorErr := historyAuthorMap(root, commits)
+	var batch *gitBatchReader
+	if len(commits) > 0 {
+		batch, _ = newGitBatchReaderForCommit(root, commits[0])
+	}
+	blobCache := map[string][]byte{}
+	readBlob := func(rev, path string, remaining int) ([]byte, bool, int, error) {
+		if batch == nil {
+			return historyBlob(root, rev, path, remaining)
+		}
+		b, ok, size, err := historyBlobBatch(root, rev, path, remaining, batch, blobCache)
+		if err != nil && batch.failed {
+			_ = batch.Close()
+			batch = nil
+			return historyBlob(root, rev, path, remaining)
+		}
+		return b, ok, size, err
+	}
 	filesAnalyzed := 0
+	metadataBytes := 0
 	for _, commit := range commits {
-		parents, err := gitFields(root, "rev-list", "--parents", "-n", "1", commit)
-		if err != nil || len(parents) == 0 {
+		if parentErr != nil {
+			continue
+		}
+		parentIDs, ok := parentMap[commit]
+		if !ok {
 			r.Partial = true
 			r.Reason = "commit parent metadata unavailable"
 			continue
 		}
-		if len(parents) > 2 {
+		if len(parentIDs) > 1 {
 			r.Partial = true
 			if r.Reason == "" {
 				r.Reason = "merge commits excluded to avoid duplicate attribution"
@@ -50,8 +79,8 @@ func applyHistoricalTestAttribution(e testEvidence, root string, commits []strin
 			continue
 		}
 		parent := ""
-		if len(parents) == 2 {
-			parent = parents[1]
+		if len(parentIDs) == 1 {
+			parent = parentIDs[0]
 		}
 		args := []string{"diff-tree", "--no-ext-diff", "--no-textconv", "--no-commit-id", "--name-only", "-r", "-z"}
 		if parent == "" {
@@ -82,11 +111,11 @@ func applyHistoricalTestAttribution(e testEvidence, root string, commits []strin
 		r.Commits++
 		before, after := map[string]testDefinition{}, map[string]testDefinition{}
 		for _, p := range testPaths {
-			old, oldOK, oldSize, oldErr := historyBlob(root, parent, p, complexityTotalBytes-r.Bytes)
+			old, oldOK, oldSize, oldErr := readBlob(parent, p, complexityTotalBytes-r.Bytes)
 			if oldErr == nil {
 				r.Bytes += oldSize
 			}
-			new, newOK, newSize, newErr := historyBlob(root, commit, p, complexityTotalBytes-r.Bytes)
+			new, newOK, newSize, newErr := readBlob(commit, p, complexityTotalBytes-r.Bytes)
 			if newErr == nil {
 				r.Bytes += newSize
 			}
@@ -124,27 +153,75 @@ func applyHistoricalTestAttribution(e testEvidence, root string, commits []strin
 			continue
 		}
 		r.Definitions += len(introduced)
-		meta, err := runGit(root, "show", "-s", "--format=%an%x00%ae%x00%B", commit)
-		if err != nil {
-			r.Partial = true
-			r.Reason = "commit author metadata unavailable"
-			continue
+		authorInfo, authorFound := authorMap[commit]
+		message := ""
+		metadataReady := authorErr == nil && authorFound && batch != nil
+		if metadataReady {
+			object, size, objectErr := readHistoryCommitObject(batch, commit, historyMetadataTotalMaxBytes-metadataBytes)
+			if errors.Is(objectErr, errHistoryCommitMetadataLimit) {
+				r.Partial = true
+				r.Reason = "commit author metadata byte limit exceeded"
+				continue
+			}
+			separator := bytes.Index(object, []byte("\n\n"))
+			if objectErr == nil && separator >= 0 {
+				message = string(object[separator+2:])
+				metadataBytes += size
+			} else {
+				metadataReady = false
+				if batch.failed {
+					_ = batch.Close()
+					batch = nil
+				}
+			}
 		}
-		p := strings.SplitN(string(meta), "\x00", 3)
-		if len(p) < 3 || strings.TrimSpace(p[1]) == "" {
+		if !metadataReady {
+			remaining := historyMetadataTotalMaxBytes - metadataBytes
+			if remaining <= 0 {
+				r.Partial = true
+				r.Reason = "commit author metadata byte limit exceeded"
+				continue
+			}
+			limit := historyCommitObjectMaxBytes
+			if remaining < limit {
+				limit = remaining
+			}
+			meta, err := runGitBounded(root, int64(limit), "show", "-s", "--format=%an%x00%ae%x00%B", commit)
+			if err != nil {
+				r.Partial = true
+				r.Reason = "commit author metadata unavailable or exceeded its byte cap"
+				continue
+			}
+			metadataBytes += len(meta)
+			fields := strings.SplitN(string(meta), "\x00", 3)
+			if len(fields) < 3 {
+				r.Partial = true
+				r.Reason = "commit author metadata malformed"
+				continue
+			}
+			authorInfo = historyAuthor{name: fields[0], email: fields[1]}
+			message = fields[2]
+		}
+		if strings.TrimSpace(authorInfo.email) == "" {
 			r.Partial = true
 			r.Reason = "commit author metadata malformed"
 			continue
 		}
-		author := resolve(identityInfo{Name: p[0], Email: p[1], Available: true}, identities)
+		author := resolve(identityInfo{Name: authorInfo.name, Email: authorInfo.email, Available: true}, identities)
 		credited := idKey(author) == idKey(selected) && selected.Available
-		for _, co := range parseCoauthors(p[2]) {
+		for _, co := range parseCoauthors(message) {
 			if idKey(resolve(co, identities)) == idKey(selected) && selected.Available {
 				credited = true
 			}
 		}
 		if credited {
 			r.Selected += len(introduced)
+		}
+	}
+	if batch != nil {
+		if err := batch.Close(); err != nil {
+			r.Partial = true
+			r.Reason = "historical blob unavailable"
 		}
 	}
 	if r.Partial {
@@ -250,6 +327,98 @@ func historyBlob(root, rev, path string, remaining int) ([]byte, bool, int, erro
 	}
 	return b, true, n, nil
 }
+func historyParentMap(root string, commits []string) (map[string][]string, error) {
+	parents := map[string][]string{}
+	if len(commits) == 0 {
+		return parents, nil
+	}
+	args := append([]string{"rev-list", "--parents", "--no-walk"}, commits...)
+	out, err := runGitBounded(root, 8<<20, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			parents[fields[0]] = fields[1:]
+		}
+	}
+	for _, commit := range commits {
+		if _, ok := parents[commit]; !ok {
+			return nil, fmt.Errorf("parent metadata missing for commit")
+		}
+	}
+	return parents, nil
+}
+
+func historyAuthorMap(root string, commits []string) (map[string]historyAuthor, error) {
+	authors := map[string]historyAuthor{}
+	if len(commits) == 0 {
+		return authors, nil
+	}
+	args := append([]string{"log", "-z", "--no-walk=unsorted", "--format=%H%x00%an%x00%ae"}, commits...)
+	out, err := runGitBounded(root, 8<<20, args...)
+	if err != nil {
+		return nil, err
+	}
+	fields := bytes.Split(out, []byte{0})
+	if len(fields) > 0 && len(fields[len(fields)-1]) == 0 {
+		fields = fields[:len(fields)-1]
+	}
+	if len(fields) != 3*len(commits) {
+		return nil, fmt.Errorf("history author record count mismatch")
+	}
+	for i := 0; i < len(fields); i += 3 {
+		id := string(fields[i])
+		authors[id] = historyAuthor{commit: id, name: string(fields[i+1]), email: string(fields[i+2])}
+	}
+	return authors, nil
+}
+
+func historyBlobBatch(root, rev, path string, remaining int, reader *gitBatchReader, cache map[string][]byte) ([]byte, bool, int, error) {
+	if rev == "" {
+		return nil, false, 0, nil
+	}
+	tree, err := runGit(root, "ls-tree", "-z", rev, "--", path)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if len(tree) == 0 {
+		return nil, false, 0, nil
+	}
+	parts := strings.SplitN(strings.TrimSuffix(string(tree), "\x00"), "\t", 2)
+	if len(parts) != 2 {
+		return nil, false, 0, fmt.Errorf("invalid tree entry")
+	}
+	fields := strings.Fields(parts[0])
+	if len(fields) != 3 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") {
+		return nil, false, 0, fmt.Errorf("changed test path is not a regular blob")
+	}
+	oid := fields[2]
+	kind, size, err := reader.Info(oid)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if kind != "blob" || size > complexityFileBytes || size > remaining {
+		return nil, false, 0, fmt.Errorf("blob exceeds remaining history limit")
+	}
+	if content, ok := cache[oid]; ok {
+		if len(content) != size {
+			return nil, false, 0, fmt.Errorf("blob size changed")
+		}
+		return content, true, size, nil
+	}
+	kind, content, readSize, err := reader.Read(oid, remaining)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if kind != "blob" || readSize != size || len(content) != size {
+		return nil, false, 0, fmt.Errorf("blob size changed")
+	}
+	cache[oid] = content
+	return content, true, size, nil
+}
+
 func mergeTestDefs(dst, src map[string]testDefinition) {
 	for k, v := range src {
 		dst[k] = v

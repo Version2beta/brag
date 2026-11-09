@@ -829,7 +829,7 @@ func executeDynamic(total context.Context, dir, artifactDir, label, identity str
 	} else {
 		r.Coverage.Status = "unavailable"
 		r.ArtifactIncomplete = true
-		if err != nil {
+		if err != nil && ctx.Err() == nil && total.Err() == nil {
 			if r.TestCounts["fail"] > 0 {
 				r.Classification = "test_failure"
 			} else {

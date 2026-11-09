@@ -194,7 +194,7 @@ func TestV2SchemaDeclaresRequiredReportAndEngineeringFields(t *testing.T) {
 		t.Fatalf("v2 schema_version const=%d want %d err=%v", version.Const, reportSchemaVersion, err)
 	}
 
-	raw, err := json.Marshal(report{SchemaVersion: reportSchemaVersion, ToolVersion: "1.0.0", ConfigVersion: 1, Repository: ".", Scope: "all", History: historyInfo{IncludedCommitIDs: []string{}, Boundary: "test"}, Contributors: []Person{}, RepositoryMeasures: repositoryMeasures{}, WorkingTree: worktree{}, Unavailable: map[string]unavailable{}, Warnings: []string{}})
+	raw, err := json.Marshal(report{SchemaVersion: reportSchemaVersion, ToolVersion: "v0.1.0-rc.1", ConfigVersion: 1, Repository: ".", Scope: "all", History: historyInfo{IncludedCommitIDs: []string{}, Boundary: "test"}, Contributors: []Person{}, RepositoryMeasures: repositoryMeasures{}, WorkingTree: worktree{}, Unavailable: map[string]unavailable{}, Warnings: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
