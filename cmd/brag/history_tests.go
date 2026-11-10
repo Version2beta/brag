@@ -20,22 +20,32 @@ const historicalFilesLimit = 5000
 const historicalFilesPerCommit = 100
 
 type historicalResult struct {
-	Definitions int
-	Selected    int
-	Commits     int
-	Bytes       int
-	Partial     bool
-	Reason      string
+	Definitions      int
+	Selected         int
+	Commits          int
+	CommitsAttempted int
+	Bytes            int
+	Partial          bool
+	Reason           string
 }
 
 func applyHistoricalTestAttribution(e testEvidence, root string, commits []string, selected identityInfo, identities maps) testEvidence {
+	return applyHistoricalTestAttributionWithLimit(e, root, commits, selected, identities, historicalCommitLimit)
+}
+
+func applyHistoricalTestAttributionWithLimit(e testEvidence, root string, commits []string, selected identityInfo, identities maps, commitLimit int) testEvidence {
 	r := historicalResult{}
 	includedCommitCount := len(commits)
-	if len(commits) > historicalCommitLimit {
+	if commitLimit < 0 {
+		commitLimit = 0
+	}
+	if len(commits) > commitLimit {
 		r.Partial = true
 		r.Reason = "commit analysis cap exceeded"
-		commits = commits[:historicalCommitLimit]
+		commits = commits[:commitLimit]
 	}
+	scheduledCommitCount := len(commits)
+	commitCapOmitted := includedCommitCount - scheduledCommitCount
 	parentMap, parentErr := historyParentMap(root, commits)
 	if parentErr != nil {
 		r.Partial = true
@@ -62,6 +72,7 @@ func applyHistoricalTestAttribution(e testEvidence, root string, commits []strin
 	filesAnalyzed := 0
 	metadataBytes := 0
 	for _, commit := range commits {
+		r.CommitsAttempted++
 		if parentErr != nil {
 			continue
 		}
@@ -239,22 +250,30 @@ func applyHistoricalTestAttribution(e testEvidence, root string, commits []strin
 		e.AllTestsAddedRatio.Status = "measured"
 		e.AllTestsAddedRatio.Reason = "new valid TestX functions per included commit; merge commits contribute zero and are excluded"
 	}
-	n, d := r.Selected, r.Definitions
-	e.SelectedTestsAddedRatio.Numerator = &n
-	e.SelectedTestsAddedRatio.Denominator = d
-	n, d = r.Definitions, includedCommitCount
-	e.AllTestsAddedRatio.Numerator = &n
-	e.AllTestsAddedRatio.Denominator = d
+	selectedNumerator, selectedDenominator := r.Selected, r.Definitions
+	e.SelectedTestsAddedRatio.Numerator = &selectedNumerator
+	e.SelectedTestsAddedRatio.Denominator = selectedDenominator
+	allTestsNumerator, analyzedCommitDenominator := r.Definitions, r.CommitsAttempted
+	e.AllTestsAddedRatio.Numerator = &allTestsNumerator
+	e.AllTestsAddedRatio.Denominator = analyzedCommitDenominator
+	e.AllTestsAddedRatio.DenominatorUnit = "analyzed included commits (first-parent comparisons attempted; merges excluded from attribution)"
 	if !selected.Available {
 		e.SelectedTestsAddedRatio.Status = "unavailable"
 		e.SelectedTestsAddedRatio.Numerator = nil
 		e.SelectedTestsAddedRatio.Reason = "selected contributor identity unavailable"
 	}
 	e.HistoricalAttribution.Count = r.Definitions
+	e.HistoricalAttribution.Units = fmt.Sprintf("%d of %d included commits attempted; %d non-merge first-parent diff/file lists read", r.CommitsAttempted, includedCommitCount, r.Commits)
+	if commitCapOmitted > 0 {
+		e.HistoricalAttribution.Warnings = append(e.HistoricalAttribution.Warnings, fmt.Sprintf("The %d-commit cap omitted %d of %d included commits; %d commits were scheduled.", commitLimit, commitCapOmitted, includedCommitCount, scheduledCommitCount))
+	}
+	if r.CommitsAttempted < scheduledCommitCount {
+		e.HistoricalAttribution.Warnings = append(e.HistoricalAttribution.Warnings, fmt.Sprintf("Analysis stopped before %d of %d scheduled commits were attempted after %d attempts; reason: %s.", scheduledCommitCount-r.CommitsAttempted, scheduledCommitCount, r.CommitsAttempted, r.Reason))
+	}
 	if r.Partial {
 		e.Status = "partial"
 	}
-	e.Limitations = append(e.Limitations, "Historical TestX attribution uses first-parent changed-file comparisons; merge commits are excluded, aliases and Co-authored-by trailers are resolved, and coauthor credits may overlap author credits", fmt.Sprintf("History caps: %d commits, %d changed test files/commit, %d total changed test files, %d bytes total; over-limit or unparseable history is partial.", historicalCommitLimit, historicalFilesPerCommit, historicalFilesLimit, complexityTotalBytes))
+	e.Limitations = append(e.Limitations, "Historical TestX attribution uses first-parent changed-file comparisons; merge commits are excluded, aliases and Co-authored-by trailers are resolved, and coauthor credits may overlap author credits", fmt.Sprintf("History limits: at most %d included commits analyzed (of the supplied history), %d changed test files/commit, %d total changed test files, %d bytes total; over-limit or unparseable history is partial. Ratios use analyzed included commits, not omitted commits.", commitLimit, historicalFilesPerCommit, historicalFilesLimit, complexityTotalBytes))
 	return e
 }
 

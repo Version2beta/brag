@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync, chmodSync, mkdtempSync, rmSync, realpathSync, symlinkSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, mkdirSync, mkdtempSync, rmSync, realpathSync, symlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -73,14 +73,19 @@ test("Pi handler validates branch/all reports and sends exact evidence message w
   assert.match(prompt, /"documentation":/);
   assert.match(prompt, /"architecture":/);
   assert.match(prompt, /"security":/);
-  assert.match(prompt, /static security indicators are not vulnerability findings or assurance/);
-  assert.match(prompt, /numerical\/composite scores/);
-  assert.match(prompt, /never exceed 800 words/);
-  assert.match(prompt, /Do not add a separate Provenance section/);
+  assert.match(prompt, /Security indicators are not findings or assurance; scanner status is not_run/);
+  assert.match(prompt, /compact Markdown infographic\/dashboard, not prose or a metric dump/);
+  assert.match(prompt, /exactly these six compact cards/);
+  assert.match(prompt, /substantially shorter than a 600–700-word narrative/);
+  assert.match(prompt, /say unavailable\/not provided if absent; never infer/);
+  assert.match(prompt, /HEAD vs current-tracked-worktree distinctions/);
+  assert.match(prompt, /not_run/);
+  assert.match(prompt, /Do not fabricate scores, rankings, quality labels, composite\/progress bars/);
+  assert.match(prompt, /all-scope net baseline is unavailable/);
   assert.match(prompt, /provenance\.selected_contributor\.author_commit_ratio/);
-  assert.match(prompt, /same ratio for all three values/);
-  assert.match(prompt, /Go-only complexity, test inventory\/test additions, architecture/);
-  assert.match(prompt, /reporting non-Go counts as unsupported and never implying whole-repository code coverage/);
+  assert.match(prompt, /exact numerator\/denominator and supplied percentage from the same/);
+  assert.match(prompt, /Complexity, test inventory\/additions, architecture, and security indicators are Go-only/);
+  assert.match(prompt, /disclose non-Go counts as unsupported and never imply whole-repository code coverage/);
   const evidenceMatch = prompt.match(/<untrusted-brag-evidence-json>\n([\s\S]*?)\n<\/untrusted-brag-evidence-json>/);
   assert.ok(evidenceMatch);
   const projection = JSON.parse(evidenceMatch[1]);
@@ -162,6 +167,66 @@ test("BRAG executable realpaths inside the repository are rejected from a subdir
       assert.equal(h.messages.length, 0);
     }
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("unset BRAG_BIN and BRAG_GIT resolve from absolute PATH entries and reject repository BRAG binaries", { skip: !git || !path.isAbsolute(git) || process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "brag-path-resolution-test-"));
+  const binDir = path.join(dir, "bin");
+  mkdirSync(binDir);
+  const repo = mkdtempSync(path.join(dir, "repo-"));
+  const gitEnv = { ...process.env };
+  for (const name of Object.keys(gitEnv)) if (name.startsWith("GIT_")) delete gitEnv[name];
+  execFileSync(git, ["-C", repo, "init", "-q"], { env: gitEnv });
+
+  const originalEnv = Object.fromEntries(["BRAG_BIN", "BRAG_GIT", "BRAG_SELECTED", "PATH"].map(name => [name, process.env[name]]));
+  const marker = path.join(dir, "brag-invoked");
+  const childPath = path.join(dir, "child-path");
+  const gitDir = path.dirname(realpathSync(git));
+  const shellQuote = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const writeFakeBrag = (file, calledMarker) => {
+    writeFileSync(file, `#!/bin/sh\nprintf called > ${shellQuote(calledMarker)}\nprintf '%s' "$PATH" > ${shellQuote(childPath)}\nprintf '%s' ${shellQuote('{"schema_version":3}')}\n`);
+    chmodSync(file, 0o700);
+  };
+  const fakeBrag = path.join(binDir, "brag");
+  writeFakeBrag(fakeBrag, marker);
+
+  try {
+    delete process.env.BRAG_BIN;
+    delete process.env.BRAG_SELECTED;
+    delete process.env.BRAG_GIT;
+    process.env.PATH = [binDir, gitDir, originalEnv.PATH].filter(Boolean).join(path.delimiter);
+    const pathHarness = harness();
+    pathHarness.ctx.cwd = repo;
+    await pathHarness.command.handler("all", pathHarness.ctx);
+    assert.match(pathHarness.notifications.pop().message, /unsupported BRAG schema version/);
+    assert.equal(readFileSync(marker, "utf8"), "called");
+    assert.equal(readFileSync(childPath, "utf8"), gitDir);
+
+    const inRepoMarker = path.join(dir, "repository-brag-invoked");
+    writeFakeBrag(path.join(repo, "brag"), inRepoMarker);
+    process.env.PATH = [repo, gitDir, originalEnv.PATH].filter(Boolean).join(path.delimiter);
+    const repositoryHarness = harness();
+    repositoryHarness.ctx.cwd = repo;
+    await repositoryHarness.command.handler("all", repositoryHarness.ctx);
+    assert.match(repositoryHarness.notifications.pop().message, /BRAG_BIN must be outside the analyzed repository/);
+    assert.equal(existsSync(inRepoMarker), false);
+
+    rmSync(marker, { force: true });
+    rmSync(childPath, { force: true });
+    process.env.PATH = path.relative(process.cwd(), binDir);
+    const relativePathHarness = harness();
+    relativePathHarness.ctx.cwd = repo;
+    await relativePathHarness.command.handler("all", relativePathHarness.ctx);
+    assert.match(relativePathHarness.notifications.pop().message, /BRAG_BIN is unset and "brag" was not found on PATH/);
+    assert.equal(existsSync(marker), false);
+    assert.equal(existsSync(childPath), false);
+  } finally {
+    for (const [name, value] of Object.entries(originalEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });

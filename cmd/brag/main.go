@@ -46,30 +46,31 @@ type Counts struct {
 	SourceLinesDeleted int `json:"source_lines_deleted"`
 }
 type report struct {
-	SchemaVersion          int                     `json:"schema_version"`
-	ToolVersion            string                  `json:"tool_version"`
-	ConfigVersion          int                     `json:"config_version"`
-	Repository             string                  `json:"repository"`
-	Scope                  string                  `json:"scope"`
-	Head                   string                  `json:"head"`
-	Base                   *baseInfo               `json:"base"`
-	History                historyInfo             `json:"history"`
-	SelectedIdentity       identityInfo            `json:"selected_identity"`
-	WorkingTreeStateID     string                  `json:"working_tree_state_identity"`
-	WorkingTreeStateMethod string                  `json:"working_tree_state_method"`
-	Attribution            attribution             `json:"attribution"`
-	Contributors           []Person                `json:"contributors"`
-	RepositoryMeasures     repositoryMeasures      `json:"repository_measures"`
-	NetSourceChange        *netChange              `json:"net_source_change"`
-	SelectedContributor    *selected               `json:"selected_contributor"`
-	Measures               measureInfo             `json:"measures"`
-	WorkingTree            worktree                `json:"working_tree"`
-	Unavailable            map[string]unavailable  `json:"unavailable"`
-	Warnings               []string                `json:"warnings"`
-	EngineeringEvidence    engineeringEvidence     `json:"engineering_evidence"`
-	DynamicTests           *dynamicEvidence        `json:"dynamic_tests,omitempty"`
-	MutationTests          *mutationReport         `json:"mutation_tests,omitempty"`
-	TestContributions      *testContributionReport `json:"test_contributions,omitempty"`
+	SchemaVersion              int                         `json:"schema_version"`
+	ToolVersion                string                      `json:"tool_version"`
+	ConfigVersion              int                         `json:"config_version"`
+	Repository                 string                      `json:"repository"`
+	Scope                      string                      `json:"scope"`
+	Head                       string                      `json:"head"`
+	Base                       *baseInfo                   `json:"base"`
+	History                    historyInfo                 `json:"history"`
+	SelectedIdentity           identityInfo                `json:"selected_identity"`
+	WorkingTreeStateID         string                      `json:"working_tree_state_identity"`
+	WorkingTreeStateMethod     string                      `json:"working_tree_state_method"`
+	Attribution                attribution                 `json:"attribution"`
+	Contributors               []Person                    `json:"contributors"`
+	RepositoryMeasures         repositoryMeasures          `json:"repository_measures"`
+	NetSourceChange            *netChange                  `json:"net_source_change"`
+	SelectedContributor        *selected                   `json:"selected_contributor"`
+	Measures                   measureInfo                 `json:"measures"`
+	WorkingTree                worktree                    `json:"working_tree"`
+	Unavailable                map[string]unavailable      `json:"unavailable"`
+	Warnings                   []string                    `json:"warnings"`
+	EngineeringEvidence        engineeringEvidence         `json:"engineering_evidence"`
+	DynamicTests               *dynamicEvidence            `json:"dynamic_tests,omitempty"`
+	MutationTests              *mutationReport             `json:"mutation_tests,omitempty"`
+	TestContributions          *testContributionReport     `json:"test_contributions,omitempty"`
+	TestContributionComparison *testContributionComparison `json:"test_contribution_comparison,omitempty"`
 }
 type identityInfo struct {
 	Name      string `json:"name"`
@@ -136,6 +137,7 @@ var repo string
 const reportSchemaVersion = 2
 const mutationReportSchemaVersion = 4
 const contributionReportSchemaVersion = 5
+const contributionComparisonSchemaVersion = 6
 
 func gitEnvironment(env []string) []string {
 	filtered := make([]string, 0, len(env)+2)
@@ -159,18 +161,25 @@ func text(args ...string) (string, error) {
 }
 func die(e error) { fmt.Fprintln(os.Stderr, "brag:", e); os.Exit(2) }
 func main() {
-	if len(os.Args) == 2 && (os.Args[1] == "--help" || os.Args[1] == "-h" || os.Args[1] == "help") {
-		fmt.Println("Usage: brag [--base REF] [--config FILE] [--selected NAME=EMAIL] [--identity NAME=EMAIL] [--alias EMAIL=CANONICAL_EMAIL]")
-		fmt.Println("       brag all [options]")
-		fmt.Println("Dynamic execution is opt-in: --dynamic-tests [--dynamic-repeat 1..3] [--dynamic-timeout D] [--dynamic-total-timeout D] [--dynamic-artifacts DIR]")
-		fmt.Println("Mutation tests are opt-in: --mutation-tests [--mutation-limit 1..50] [--mutation-package PATH] [--mutation-path PATH] [--mutation-snapshot NAME]")
-		fmt.Println("Test contribution analysis requires --mutation-tests and is experimental: --test-contributions")
-		fmt.Println("Timeouts must be positive whole milliseconds; caller cancellation emits the static report and exits 130.")
-		fmt.Println("Dynamic tests execute trusted repository code with host privileges; they are not sandboxed.")
-		fmt.Println("Branch scope requires a configured upstream or explicit --base. JSON is written to stdout.")
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "skill" {
+		if err := runSkill(args[1:]); err != nil {
+			die(err)
+		}
 		return
 	}
-	args := os.Args[1:]
+	if len(args) > 1 && args[0] == "help" && args[1] == "skill" {
+		printSkillHelp(os.Stdout)
+		return
+	}
+	if len(args) == 1 && args[0] == "help" || hasHelpFlag(args) {
+		if len(args) > 0 && args[0] == "all" {
+			printAllHelp(os.Stdout)
+		} else {
+			printMainHelp(os.Stdout)
+		}
+		return
+	}
 	scope := "branch"
 	if len(args) > 0 && args[0] == "all" {
 		scope = "all"
@@ -178,6 +187,7 @@ func main() {
 	}
 	fs := flag.NewFlagSet("brag", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
+	fs.Usage = func() { printMainHelp(fs.Output()) }
 	baseArg := fs.String("base", "", "branch base ref")
 	cfgArg := fs.String("config", "", "identity config file")
 	whoArg := fs.String("selected", "", "selected contributor NAME=EMAIL")
@@ -376,12 +386,20 @@ func main() {
 		r.SchemaVersion = mutationReportSchemaVersion
 		if *testContributionsArg {
 			r.SchemaVersion = contributionReportSchemaVersion
-			r.TestContributions = &testContributionReport{Status: "unavailable", Limitations: []string{"test-level contribution evaluation is not implemented; no test-level detection or attribution is inferred"}}
+			if scope == "all" {
+				r.SchemaVersion = contributionComparisonSchemaVersion
+			} else {
+				r.TestContributions = &testContributionReport{Status: "unavailable", Limitations: []string{"test-level contribution evaluation is unavailable in the selected mode"}}
+			}
 		}
 		signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		r.MutationTests = runMutationTests(signalCtx, scope, head, base, repo, *mutationLimit, *dynamicTimeout, *dynamicTotal, *dynamicArtifacts, mutationPackages, mutationPaths, mutationSnapshots)
 		if *testContributionsArg {
-			r.TestContributions = collectContributionPopulation(signalCtx, repo, scope, head, base, *dynamicArtifacts, mutationSnapshots, r.MutationTests, *contributionTimeout, *contributionTotal, *contributionRepeat, commits, me, cm)
+			if scope == "all" {
+				r.TestContributionComparison = collectTestContributionComparison(signalCtx, repo, head, *dynamicArtifacts, mutationSnapshots, r.MutationTests, *contributionTimeout, *contributionTotal, *contributionRepeat, commits, me, cm)
+			} else {
+				r.TestContributions = collectContributionPopulation(signalCtx, repo, scope, head, base, *dynamicArtifacts, mutationSnapshots, r.MutationTests, *contributionTimeout, *contributionTotal, *contributionRepeat, commits, me, cm)
+			}
 		}
 		dynamicCancelled := signalCtx.Err() != nil
 		stopSignals()

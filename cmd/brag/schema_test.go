@@ -182,6 +182,55 @@ func TestV5SchemaDeclaresContributionSection(t *testing.T) {
 	}
 }
 
+func TestV6SchemaDeclaresOptInContributionComparison(t *testing.T) {
+	schema := readSchema(t, "brag-v6.schema.json")
+	var version struct {
+		Const int `json:"const"`
+	}
+	if json.Unmarshal(schema.Properties["schema_version"], &version) != nil || version.Const != 6 {
+		t.Fatalf("v6 schema version=%d", version.Const)
+	}
+	if !hasField(schema.Required, "test_contribution_comparison") {
+		t.Fatal("v6 must require comparison report")
+	}
+	for _, field := range []string{"mutation_ids", "shared_tests", "unattributed_tests", "indeterminate_tests", "history_attribution_status", "cohorts", "matrix_artifact", "matrix_sha256"} {
+		if _, ok := schema.Defs["test_contribution_comparison"].Properties[field]; !ok {
+			t.Errorf("v6 comparison schema missing %s", field)
+		}
+	}
+	for _, field := range []string{"shared_tests", "unattributed_tests"} {
+		var nullable struct {
+			OneOf []struct {
+				Type string `json:"type"`
+			} `json:"oneOf"`
+		}
+		if err := json.Unmarshal(schema.Defs["test_contribution_comparison"].Properties[field], &nullable); err != nil {
+			t.Fatalf("decode nullable %s schema: %v", field, err)
+		}
+		foundNull := false
+		for _, option := range nullable.OneOf {
+			if option.Type == "null" {
+				foundNull = true
+			}
+		}
+		if !foundNull {
+			t.Errorf("%s must allow null when attribution is incomplete", field)
+		}
+	}
+	if _, ok := schema.Defs["test_contributions"].Properties["manifest_sha256"]; !ok {
+		t.Fatal("v6 must preserve v5 contribution contract")
+	}
+	cohort := schema.Defs["comparison_cohort"]
+	for _, field := range []string{"detected_mutations", "complete_mutation_denominator_unit", "eligible_tests", "selected_tests", "omitted_tests"} {
+		if _, ok := cohort.Properties[field]; !ok {
+			t.Errorf("v6 cohort schema missing %s", field)
+		}
+	}
+	if _, old := cohort.Properties["additional_detected"]; old {
+		t.Fatal("ambiguous additional_detected remains in v6 comparison")
+	}
+}
+
 func TestV2SchemaDeclaresRequiredReportAndEngineeringFields(t *testing.T) {
 	schema := readSchema(t, "brag-v2.schema.json")
 	if _, ok := schema.Properties["engineering_evidence"]; !ok || !hasField(schema.Required, "engineering_evidence") {
