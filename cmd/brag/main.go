@@ -137,7 +137,7 @@ var repo string
 const reportSchemaVersion = 2
 const mutationReportSchemaVersion = 4
 const contributionReportSchemaVersion = 5
-const contributionComparisonSchemaVersion = 6
+const contributionComparisonSchemaVersion = 7
 
 func gitEnvironment(env []string) []string {
 	filtered := make([]string, 0, len(env)+2)
@@ -160,8 +160,32 @@ func text(args ...string) (string, error) {
 	return strings.TrimSpace(string(b)), e
 }
 func die(e error) { fmt.Fprintln(os.Stderr, "brag:", e); os.Exit(2) }
+func canonicalDirectory(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", errors.New("path is not a directory")
+	}
+	return canonical, nil
+}
 func main() {
 	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "author-evidence" {
+		if err := runAuthorEvidence(args[1:], os.Stdout); err != nil {
+			die(err)
+		}
+		return
+	}
 	if len(args) > 0 && args[0] == "skill" {
 		if err := runSkill(args[1:]); err != nil {
 			die(err)
@@ -192,6 +216,7 @@ func main() {
 	cfgArg := fs.String("config", "", "identity config file")
 	whoArg := fs.String("selected", "", "selected contributor NAME=EMAIL")
 	dynamicArg := fs.Bool("dynamic-tests", false, "explicitly execute Go tests in disposable snapshots")
+	expectedRootArg := fs.String("expected-root", "", "required canonical repository root for dynamic or mutation execution")
 	dynamicRepeat := fs.Int("dynamic-repeat", 1, "dynamic test runs per distinct snapshot (1-3)")
 	dynamicTimeout := fs.Duration("dynamic-timeout", 2*time.Minute, "timeout per dynamic test run (maximum 10m)")
 	dynamicTotal := fs.Duration("dynamic-total-timeout", 10*time.Minute, "total dynamic-test timeout (maximum 30m)")
@@ -225,6 +250,41 @@ func main() {
 	repo = top
 	if *testContributionsArg && !*mutationArg {
 		die(errors.New("--test-contributions requires --mutation-tests"))
+	}
+	if *mutationArg && *dynamicArg {
+		die(errors.New("--mutation-tests and --dynamic-tests cannot be combined"))
+	}
+	if *dynamicArg || *mutationArg {
+		mode := "dynamic-tests"
+		if *mutationArg {
+			mode = "mutation-tests"
+			if *testContributionsArg {
+				mode += "+test-contributions"
+			}
+		}
+		actualRoot, rootErr := canonicalDirectory(repo)
+		if rootErr != nil {
+			die(fmt.Errorf("resolve Git repository root: %w", rootErr))
+		}
+		fmt.Fprintf(os.Stderr, "brag: execution preflight: root=%s mode=%s\n", actualRoot, mode)
+		if *expectedRootArg == "" {
+			die(errors.New("--expected-root PATH is required with --dynamic-tests or --mutation-tests"))
+		}
+		expectedRoot, rootErr := canonicalDirectory(*expectedRootArg)
+		if rootErr != nil {
+			die(fmt.Errorf("invalid --expected-root: %w", rootErr))
+		}
+		actualInfo, statErr := os.Stat(actualRoot)
+		if statErr != nil {
+			die(fmt.Errorf("recheck canonical repository root: %w", statErr))
+		}
+		expectedInfo, statErr := os.Stat(expectedRoot)
+		if statErr != nil {
+			die(fmt.Errorf("recheck expected root: %w", statErr))
+		}
+		if !os.SameFile(actualInfo, expectedInfo) {
+			die(fmt.Errorf("execution root mismatch: Git root %s does not match --expected-root %s", actualRoot, expectedRoot))
+		}
 	}
 	if *testContributionsArg && *dynamicArg {
 		die(errors.New("--test-contributions cannot be combined with --dynamic-tests"))

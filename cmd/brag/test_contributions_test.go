@@ -101,6 +101,9 @@ func TestContributionSuiteInteractionClassifications(t *testing.T) {
 }
 
 func TestContributionSelectorDetectsOnlySelectedTestFailures(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping isolated selector test-suite execution in short mode")
+	}
 	dir := t.TempDir()
 	write := func(name, data string) {
 		t.Helper()

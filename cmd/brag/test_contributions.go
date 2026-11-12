@@ -502,10 +502,13 @@ func collectContributionPopulation(parent context.Context, root, scope, head str
 			for _, change := range r.DefinitionChanges {
 				r.DefinitionCounts[change.Status]++
 			}
-			credits, historyEvents, historyPartial, historyReason := resolveContributionHistory(root, commits, selected, identities)
+			credits, historyEvents, historyPartial, historyReason := resolveContributionHistory(root, commits, selected, identities, contributionCandidatePaths(allEligibleTests))
 			r.HistoryEvents = historyEvents
 			if historyPartial {
 				r.HistoryAttributionStatus = "partial"
+				// Partial history cannot establish a current definition's latest event.
+				credits["selected"] = map[string]bool{}
+				credits["all_developers"] = map[string]bool{}
 			} else {
 				r.HistoryAttributionStatus = "measured"
 			}

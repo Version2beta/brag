@@ -3,21 +3,39 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path"
 	"sort"
 	"strings"
 	"time"
 )
 
-const contributionHistoryCommitLimit = 500
+const contributionHistoryChunkSize = 500
+const contributionHistoryChunkBytes = 8 << 20
+const contributionHistoryDiffOutputBytes = 32 << 20
 const contributionHistoryFileLimit = 100
 const contributionHistoryTotalFiles = 5000
+const contributionHistoryEventLimit = 50000
 const contributionHistoryModuleBytes = 32 << 20
 
 type contributionDefinition struct {
 	Key, Name, Hash string
 	Test            contributionTest
+}
+
+func contributionCandidatePaths(tests []contributionTest) []string {
+	seen := map[string]bool{}
+	paths := []string{}
+	for _, test := range tests {
+		if !seen[test.File] {
+			seen[test.File] = true
+			paths = append(paths, test.File)
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func contributionDefinitions(entries []snapshotEntry) map[string]contributionDefinition {
@@ -221,183 +239,458 @@ func historicalDefinitionKey(cache *historicalModuleCache, rev, file, definition
 	return pkg + "\x00" + definitionKey, nil
 }
 
-func resolveContributionHistory(root string, commits []string, selected identityInfo, identities maps) (map[string]map[string]bool, []contributionDefinitionChange, bool, string) {
+type contributionDiffFile struct {
+	path, sourcePath, oldOID, newOID, status string
+}
+
+type contributionCommit struct {
+	message string
+}
+
+func candidatePathContains(paths []string, candidate string) bool {
+	index := sort.SearchStrings(paths, candidate)
+	return index < len(paths) && paths[index] == candidate
+}
+
+func contributionDiffChunk(root string, commits, candidatePaths []string, filterCandidates bool) (map[string][]contributionDiffFile, int, error) {
+	input := strings.NewReader(strings.Join(commits, "\n") + "\n")
+	args := []string{"-C", root, "diff-tree", "--no-ext-diff", "--no-textconv", "--root", "--raw", "--no-abbrev", "-M", "-m", "-r", "-z", "--stdin", "--"}
+	if filterCandidates {
+		for _, candidate := range candidatePaths {
+			args = append(args, ":(literal)"+candidate)
+		}
+	} else {
+		args = append(args, ":(glob)**/*_test.go")
+	}
+	cmd := exec.Command("git", args...)
+	cmd.Env = gitEnvironment(os.Environ())
+	cmd.Stdin = input
+	out, err := runCommandBounded(cmd, contributionHistoryChunkBytes)
+	if err != nil {
+		return nil, 0, err
+	}
+	fields := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	result := map[string][]contributionDiffFile{}
+	for i := 0; i < len(fields); {
+		commit := fields[i]
+		i++
+		for i < len(fields) && strings.HasPrefix(fields[i], ":") {
+			header := strings.Fields(strings.TrimPrefix(fields[i], ":"))
+			i++
+			if len(header) != 5 || i >= len(fields) {
+				return nil, len(out), fmt.Errorf("malformed raw contribution diff")
+			}
+			name := fields[i]
+			i++
+			status := header[4]
+			file := contributionDiffFile{path: name, sourcePath: name, oldOID: header[2], newOID: header[3], status: status}
+			if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
+				if i >= len(fields) {
+					return nil, len(out), fmt.Errorf("malformed renamed contribution path")
+				}
+				// Raw rename records list the source path first and destination second.
+				file.path = fields[i]
+				i++
+			}
+			result[commit] = append(result[commit], file)
+		}
+	}
+	return result, len(out), nil
+}
+
+func contributionCommitMetadata(reader *gitBatchReader, oid string, remaining int) (contributionCommit, int, error) {
+	kind, size, err := reader.Info(oid)
+	if err != nil {
+		return contributionCommit{}, 0, err
+	}
+	if kind != "commit" || size > historyCommitObjectMaxBytes || size > remaining {
+		return contributionCommit{}, size, errHistoryCommitMetadataLimit
+	}
+	kind, data, actual, err := reader.Read(oid, historyCommitObjectMaxBytes)
+	if err != nil {
+		return contributionCommit{}, 0, err
+	}
+	if kind != "commit" || actual != size {
+		return contributionCommit{}, 0, fmt.Errorf("history commit metadata type or size mismatch")
+	}
+	separator := strings.Index(string(data), "\n\n")
+	if separator < 0 {
+		return contributionCommit{}, size, fmt.Errorf("commit metadata boundary unavailable")
+	}
+	return contributionCommit{message: string(data[separator+2:])}, size, nil
+}
+
+func contributionAuthorMap(root string, commits []string) (map[string]historyAuthor, int, error) {
+	if len(commits) == 0 {
+		return map[string]historyAuthor{}, 0, nil
+	}
+	args := append([]string{"log", "-z", "--no-walk=unsorted", "--format=%H%x00%an%x00%ae"}, commits...)
+	data, err := runGitBounded(root, historyAuthorLogMaxBytes, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	authors, err := parseHistoryAuthors(data, commits)
+	if err != nil {
+		return nil, len(data), err
+	}
+	result := make(map[string]historyAuthor, len(authors))
+	for _, author := range authors {
+		if strings.TrimSpace(author.email) == "" {
+			return nil, len(data), fmt.Errorf("commit author email is empty")
+		}
+		result[author.commit] = author
+	}
+	return result, len(data), nil
+}
+
+func resolveContributionHistory(root string, commits []string, selected identityInfo, identities maps, candidatePathLists ...[]string) (map[string]map[string]bool, []contributionDefinitionChange, bool, string) {
 	credits := map[string]map[string]bool{"selected": {}, "all_developers": {}}
 	changes := []contributionDefinitionChange{}
+	filterCandidates := len(candidatePathLists) > 0
+	candidatePaths := []string{}
+	if filterCandidates {
+		seen := map[string]bool{}
+		for _, candidate := range candidatePathLists[0] {
+			if strings.HasSuffix(candidate, "_test.go") && !seen[candidate] {
+				seen[candidate] = true
+				candidatePaths = append(candidatePaths, candidate)
+			}
+		}
+		sort.Strings(candidatePaths)
+		if len(candidatePaths) == 0 {
+			return credits, changes, false, ""
+		}
+	}
 	partial := false
 	reason := ""
-	if len(commits) > contributionHistoryCommitLimit {
-		commits = commits[:contributionHistoryCommitLimit]
-		partial = true
-		reason = "included commit cap exceeded"
-	}
 	files := 0
 	historyBytes := 0
+	metadataBytes := 0
+	scannedCommits := 0
+	processedCandidateCommits := 0
+	stopHistory := false
 	moduleCache := &historicalModuleCache{root: root}
-	for _, commit := range commits {
-		parents, e := gitFields(root, "rev-list", "--parents", "-n", "1", commit)
-		if e != nil || len(parents) == 0 {
+
+	pathDiffBytes := 0
+	for chunkStart := 0; chunkStart < len(commits); chunkStart += contributionHistoryChunkSize {
+		chunkEnd := min(chunkStart+contributionHistoryChunkSize, len(commits))
+		chunk := commits[chunkStart:chunkEnd]
+		parents, parentErr := historyParentMap(root, chunk)
+		if parentErr != nil {
 			partial = true
-			reason = "commit parent metadata unavailable"
-			continue
-		}
-		if len(parents) > 2 {
-			partial = true
-			reason = "merge commits excluded from first-parent test attribution"
-			continue
-		}
-		parent := ""
-		if len(parents) == 2 {
-			parent = parents[1]
-		}
-		args := []string{"diff-tree", "--no-ext-diff", "--no-textconv", "--no-commit-id", "--name-only", "-r", "-z"}
-		if parent == "" {
-			args = append(args, "--root", commit)
-		} else {
-			args = append(args, parent, commit)
-		}
-		args = append(args, "--", "*.go")
-		b, e := runGitBounded(root, 8<<20, args...)
-		if e != nil {
-			partial = true
-			reason = "changed test path history unavailable"
-			continue
-		}
-		paths := []string{}
-		for _, p := range strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00") {
-			if strings.HasSuffix(p, "_test.go") {
-				paths = append(paths, p)
-			}
-		}
-		sort.Strings(paths)
-		if len(paths) > contributionHistoryFileLimit || files+len(paths) > contributionHistoryTotalFiles {
-			partial = true
-			reason = "historical test file cap exceeded"
+			reason = fmt.Sprintf("parent metadata chunk incomplete after %d commits; omitted %d commits: %v", scannedCommits, len(commits)-scannedCommits, parentErr)
 			break
 		}
-		files += len(paths)
-		meta, e := runGitBounded(root, 1<<20, "show", "-s", "--format=%an%x00%ae%x00%B", commit)
-		if e != nil {
+		diffs, diffBytes, diffErr := contributionDiffChunk(root, chunk, candidatePaths, filterCandidates)
+		if diffErr != nil {
 			partial = true
-			reason = "commit attribution metadata unavailable"
-			continue
+			reason = fmt.Sprintf("changed-path chunk incomplete after %d commits; omitted %d commits: %v", scannedCommits, len(commits)-scannedCommits, diffErr)
+			break
 		}
-		f := strings.SplitN(string(meta), "\x00", 3)
-		if len(f) < 3 || strings.TrimSpace(f[1]) == "" {
+		if diffBytes > contributionHistoryDiffOutputBytes-pathDiffBytes {
 			partial = true
-			reason = "commit author metadata malformed"
-			continue
+			reason = fmt.Sprintf("history path-output byte cap reached after %d commits; omitted %d commits", scannedCommits, len(commits)-scannedCommits)
+			break
 		}
-		person := resolve(identityInfo{Name: f[0], Email: f[1], Available: true}, identities)
-		selectedCredit := selected.Available && idKey(person) == idKey(resolve(selected, identities))
-		creditEmails := []string{person.Email}
-		for _, co := range parseCoauthors(f[2]) {
-			resolved := resolve(co, identities)
-			creditEmails = append(creditEmails, resolved.Email)
-			if selected.Available && idKey(resolved) == idKey(resolve(selected, identities)) {
-				selectedCredit = true
+		pathDiffBytes += diffBytes
+		relevant := make([]string, 0, len(chunk))
+		renameCommits := []string{}
+		uncertainRenames := map[string]bool{}
+		for _, commit := range chunk {
+			paths := diffs[commit]
+			for _, file := range paths {
+				if strings.HasPrefix(file.status, "R") || strings.HasPrefix(file.status, "C") {
+					partial = true
+					reason = fmt.Sprintf("candidate test-file rename/copy at %s makes path identity uncertain", commit)
+					uncertainRenames[commit] = true
+				} else if file.status == "A" || file.status == "D" {
+					renameCommits = append(renameCommits, commit)
+					break
+				}
 			}
 		}
-		sort.Strings(creditEmails)
-		creditEmails = uniqueStrings(creditEmails)
-		before, after := map[string]contributionDefinition{}, map[string]contributionDefinition{}
-		for _, p := range paths {
-			remaining := complexityTotalBytes - historyBytes
-			old, ook, oldBytes, oe := historyBlob(root, parent, p, remaining)
-			if oe == nil {
-				historyBytes += oldBytes
-			}
-			remaining = complexityTotalBytes - historyBytes
-			now, nok, newBytes, ne := historyBlob(root, commit, p, remaining)
-			if ne == nil {
-				historyBytes += newBytes
-			}
-			if oe != nil || ne != nil {
+		if len(renameCommits) > 0 {
+			renameDiffs, renameBytes, renameErr := contributionDiffChunk(root, renameCommits, nil, false)
+			if renameErr != nil {
 				partial = true
-				reason = "historical test blob unavailable"
-				continue
+				reason = fmt.Sprintf("candidate rename check incomplete after %d commits; omitted %d commits: %v", scannedCommits, len(commits)-scannedCommits, renameErr)
+				break
 			}
-			if ook {
-				ds, pe := definitionsForFile(p, old)
-				if pe != nil {
-					partial = true
-					reason = "parent test definitions malformed"
-				} else {
-					for k, d := range ds {
-						if d.Kind == "test" {
-							qualified, qe := historicalDefinitionKey(moduleCache, parent, p, k)
-							if qe != nil {
-								partial = true
-								reason = "historical package identity unavailable"
-								continue
-							}
-							before[qualified] = contributionDefinition{Key: qualified, Name: path.Base(k), Hash: d.BodyHash}
-						}
-					}
-				}
+			if renameBytes > contributionHistoryDiffOutputBytes-pathDiffBytes {
+				partial = true
+				reason = fmt.Sprintf("history path-output byte cap reached in rename check after %d commits; omitted %d commits", scannedCommits, len(commits)-scannedCommits)
+				break
 			}
-			if nok {
-				ds, pe := definitionsForFile(p, now)
-				if pe != nil {
-					partial = true
-					reason = "commit test definitions malformed"
-				} else {
-					for k, d := range ds {
-						if d.Kind == "test" {
-							qualified, qe := historicalDefinitionKey(moduleCache, commit, p, k)
-							if qe != nil {
-								partial = true
-								reason = "historical package identity unavailable"
-								continue
-							}
-							after[qualified] = contributionDefinition{Key: qualified, Name: path.Base(k), Hash: d.BodyHash}
-						}
+			pathDiffBytes += renameBytes
+			for _, commit := range renameCommits {
+				for _, file := range renameDiffs[commit] {
+					if (strings.HasPrefix(file.status, "R") || strings.HasPrefix(file.status, "C")) && (candidatePathContains(candidatePaths, file.path) || candidatePathContains(candidatePaths, file.sourcePath)) {
+						uncertainRenames[commit] = true
+						partial = true
+						reason = fmt.Sprintf("candidate test-file rename/copy at %s makes path identity uncertain", commit)
 					}
 				}
 			}
 		}
-		keys := map[string]bool{}
-		for k := range before {
-			keys[k] = true
-		}
-		for k := range after {
-			keys[k] = true
-		}
-		order := []string{}
-		for k := range keys {
-			order = append(order, k)
-		}
-		sort.Strings(order)
-		for _, k := range order {
-			a, ha := before[k]
-			b, hb := after[k]
-			status, hash := "", ""
-			if !ha && hb {
-				status = "introduced"
-				hash = b.Hash
-			} else if ha && !hb {
-				status = "removed"
-			} else if a.Hash != b.Hash {
-				status = "modified"
-				hash = b.Hash
-			} else {
+		scannedCommits += len(chunk)
+		for _, commit := range chunk {
+			paths := diffs[commit]
+			if uncertainRenames[commit] {
 				continue
 			}
-			if selectedCredit {
-				credits["selected"][k+"\x00"+hash] = true
+			parentList := parents[commit]
+			if len(parentList) > 1 {
+				if len(paths) > 0 {
+					partial = true
+					reason = fmt.Sprintf("merge commit %s changes candidate test paths; latest provenance is uncertain", commit)
+				}
+				continue
 			}
-			credits["all_developers"][k+"\x00"+hash] = true
-			changes = append(changes, contributionDefinitionChange{Key: k, Status: status, OldHash: a.Hash, NewHash: b.Hash, Commit: commit, Author: person.Email, Credits: creditEmails})
+			if len(paths) == 0 {
+				continue
+			}
+			if len(paths) > contributionHistoryFileLimit || files+len(paths) > contributionHistoryTotalFiles {
+				partial = true
+				reason = fmt.Sprintf("historical relevant test-file cap exceeded at commit %s", commit)
+				stopHistory = true
+				break
+			}
+			files += len(paths)
+			relevant = append(relevant, commit)
+		}
+		if stopHistory {
+			break
+		}
+		if len(relevant) == 0 {
+			continue
+		}
+
+		authors, authorBytes, authorErr := contributionAuthorMap(root, relevant)
+		if authorErr != nil {
+			partial = true
+			reason = fmt.Sprintf("candidate commit author chunk incomplete at commit %s: %v", relevant[0], authorErr)
+			stopHistory = true
+			break
+		}
+		if authorBytes > historyMetadataTotalMaxBytes-metadataBytes {
+			partial = true
+			reason = fmt.Sprintf("history metadata byte cap reached before candidate commit %s after %d candidate commits were processed", relevant[0], processedCandidateCommits)
+			stopHistory = true
+			break
+		}
+		metadataBytes += authorBytes
+
+		batch, batchErr := newGitBatchReader(root)
+		if batchErr != nil {
+			partial = true
+			reason = fmt.Sprintf("history object batch unavailable before candidate commit %s", relevant[0])
+			stopHistory = true
+			break
+		}
+		for _, commit := range relevant {
+			if _, ok := authors[commit]; !ok {
+				partial = true
+				reason = fmt.Sprintf("candidate commit author metadata missing for %s", commit)
+				stopHistory = true
+				break
+			}
+			remainingMetadata := historyMetadataTotalMaxBytes - metadataBytes
+			meta, objectBytes, err := contributionCommitMetadata(batch, commit, remainingMetadata)
+			if err != nil {
+				partial = true
+				reason = fmt.Sprintf("history metadata byte/object cap reached at candidate commit %s after %d candidate commits were processed", commit, processedCandidateCommits)
+				stopHistory = true
+				break
+			}
+			metadataBytes += objectBytes
+			processedCandidateCommits++
+			author := authors[commit]
+			person := resolve(identityInfo{Name: author.name, Email: author.email, Available: true}, identities)
+			selectedCredit := selected.Available && idKey(person) == idKey(resolve(selected, identities))
+			creditEmails := []string{person.Email}
+			for _, co := range parseCoauthors(meta.message) {
+				co = resolve(co, identities)
+				creditEmails = append(creditEmails, co.Email)
+				if selected.Available && idKey(co) == idKey(resolve(selected, identities)) {
+					selectedCredit = true
+				}
+			}
+			sort.Strings(creditEmails)
+			creditEmails = uniqueStrings(creditEmails)
+
+			before, after := map[string]contributionDefinition{}, map[string]contributionDefinition{}
+			parent := ""
+			if len(parents[commit]) > 0 {
+				parent = parents[commit][0]
+			}
+			for _, file := range diffs[commit] {
+				if strings.HasPrefix(file.status, "R") || strings.HasPrefix(file.status, "C") {
+					partial = true
+					reason = fmt.Sprintf("candidate test-file rename/copy at %s makes path identity uncertain", commit)
+					continue
+				}
+				old, oldExists, oldBytes, oldErr := historyBatchBlob(batch, file.oldOID, complexityTotalBytes-historyBytes)
+				if oldErr == nil {
+					historyBytes += oldBytes
+				}
+				now, newExists, newBytes, newErr := historyBatchBlob(batch, file.newOID, complexityTotalBytes-historyBytes)
+				if newErr == nil {
+					historyBytes += newBytes
+				}
+				if oldErr != nil || newErr != nil {
+					partial = true
+					reason = fmt.Sprintf("candidate test blob unavailable or byte cap exceeded at %s", file.path)
+					continue
+				}
+				for _, side := range []struct {
+					data   []byte
+					exists bool
+					rev    string
+					dst    map[string]contributionDefinition
+				}{{old, oldExists, parent, before}, {now, newExists, commit, after}} {
+					if !side.exists {
+						continue
+					}
+					definitions, parseErr := definitionsForFile(file.path, side.data)
+					if parseErr != nil {
+						partial = true
+						reason = fmt.Sprintf("candidate test definitions malformed at %s", file.path)
+						continue
+					}
+					for key, definition := range definitions {
+						if definition.Kind != "test" {
+							continue
+						}
+						qualified, keyErr := historicalDefinitionKey(moduleCache, side.rev, file.path, key)
+						if keyErr != nil {
+							partial = true
+							reason = fmt.Sprintf("candidate historical package identity unavailable at %s", file.path)
+							continue
+						}
+						side.dst[qualified] = contributionDefinition{Key: qualified, Name: path.Base(key), Hash: definition.BodyHash}
+					}
+				}
+			}
+
+			keys := map[string]bool{}
+			for key := range before {
+				keys[key] = true
+			}
+			for key := range after {
+				keys[key] = true
+			}
+			orderedKeys := make([]string, 0, len(keys))
+			for key := range keys {
+				orderedKeys = append(orderedKeys, key)
+			}
+			sort.Strings(orderedKeys)
+			for _, key := range orderedKeys {
+				old, hadOld := before[key]
+				current, hasCurrent := after[key]
+				status, hash := "", ""
+				switch {
+				case !hadOld && hasCurrent:
+					status, hash = "introduced", current.Hash
+				case hadOld && !hasCurrent:
+					status = "removed"
+				case old.Hash != current.Hash:
+					status, hash = "modified", current.Hash
+				default:
+					continue
+				}
+				if len(changes) >= contributionHistoryEventLimit {
+					partial = true
+					reason = fmt.Sprintf("historical definition event cap reached after %d events at commit %s; remaining history not scanned", len(changes), commit)
+					stopHistory = true
+					break
+				}
+				prefix := key + "\x00"
+				for version := range credits["selected"] {
+					if strings.HasPrefix(version, prefix) {
+						delete(credits["selected"], version)
+					}
+				}
+				for version := range credits["all_developers"] {
+					if strings.HasPrefix(version, prefix) {
+						delete(credits["all_developers"], version)
+					}
+				}
+				if status != "removed" {
+					if selectedCredit {
+						credits["selected"][key+"\x00"+hash] = true
+					}
+					credits["all_developers"][key+"\x00"+hash] = true
+				}
+				changes = append(changes, contributionDefinitionChange{Key: key, Status: status, OldHash: old.Hash, NewHash: current.Hash, Commit: commit, Author: person.Email, Credits: creditEmails})
+			}
+			if stopHistory {
+				break
+			}
+		}
+		if closeErr := batch.Close(); closeErr != nil {
+			partial = true
+			reason = "history object batch close failed"
+			stopHistory = true
+		}
+		if stopHistory {
+			break
 		}
 	}
-	sort.Slice(changes, func(i, j int) bool {
-		if changes[i].Commit != changes[j].Commit {
-			return changes[i].Commit < changes[j].Commit
-		}
-		return changes[i].Key < changes[j].Key
-	})
+	if partial {
+		credits = map[string]map[string]bool{"selected": {}, "all_developers": {}}
+		reason = fmt.Sprintf("%s (scanned %d/%d included commits; %d omitted)", reason, scannedCommits, len(commits), len(commits)-scannedCommits)
+	}
 	return credits, changes, partial, reason
 }
+
+func historyBatchBlob(reader *gitBatchReader, oid string, remaining int) ([]byte, bool, int, error) {
+	if oid != "" && strings.Trim(oid, "0") == "" {
+		return nil, false, 0, nil
+	}
+	if remaining < 0 {
+		return nil, false, 0, fmt.Errorf("history blob byte cap exceeded")
+	}
+	kind, size, err := reader.Info(oid)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if kind != "blob" || size > complexityFileBytes || size > remaining {
+		return nil, false, size, fmt.Errorf("historical blob exceeds bounds")
+	}
+	kind, data, actual, err := reader.Read(oid, remaining)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if kind != "blob" || actual != size {
+		return nil, false, 0, fmt.Errorf("historical blob changed")
+	}
+	return data, true, size, nil
+}
+
+func runCommandBounded(cmd *exec.Cmd, limit int) ([]byte, error) {
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err = cmd.Start(); err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(pipe, int64(limit)+1))
+	if len(data) > limit {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("command output exceeds %d byte cap", limit)
+	}
+	waitErr := cmd.Wait()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if waitErr != nil {
+		return nil, waitErr
+	}
+	return data, nil
+}
+
 func evaluateHistoricalPopulation(ctx context.Context, entries []snapshotEntry, tests []contributionTest, sites []mutationSite, ids []string, population string, pairLimit, repeats int, per time.Duration, started time.Time, total time.Duration, artifactDir string, budget *artifactBudget) ([]contributionPair, []contributionControl, int) {
 	pairs, omitted := contributionMatrix(tests, ids, pairLimit)
 	for i := range pairs {

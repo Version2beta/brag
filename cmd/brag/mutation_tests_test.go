@@ -192,6 +192,9 @@ func TestMutationAppliesOneExactToken(t *testing.T) {
 	}
 }
 func TestMutationRunnerControlGateIsolationAndEvidence(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping mutation control and mutant test-suite execution in short mode")
+	}
 	d, _ := mkRepo(t)
 	writeMutationFixture(t, d, `package app
 func Less(x int) bool { return x < 2 }
@@ -225,6 +228,9 @@ func TestGateAndIsolation(t *testing.T) { if _,e:=os.Stat("marker"); e==nil { t.
 	}
 }
 func TestMutationRunnerControlFailureIsInconclusive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping failing mutation control test-suite execution in short mode")
+	}
 	d, _ := mkRepo(t)
 	writeMutationFixture(t, d, "package app\nfunc F(x int)bool{return x<2}\n", "package app\nimport \"testing\"\nfunc TestNo(t *testing.T){t.Fatal(\"control\")}\n")
 	r := runMutationTests(context.Background(), "all", gitCmd(t, d, "rev-parse", "HEAD"), nil, d, 4, 20*time.Second, time.Minute, privateTempDir(t), nil, nil, nil)
@@ -234,6 +240,9 @@ func TestMutationRunnerControlFailureIsInconclusive(t *testing.T) {
 	}
 }
 func TestMutationBranchSnapshotsAndUntrackedExclusion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-snapshot mutation test-suite execution in short mode")
+	}
 	d, _ := mkRepo(t)
 	writeMutationFixture(t, d, "package app\nfunc F(x int)bool{return x<2}\n", "package app\nimport \"testing\"\nfunc TestF(t *testing.T){if !F(1){t.Fatal(\"bad\")}}\n")
 	base := gitCmd(t, d, "rev-parse", "HEAD")
@@ -266,6 +275,9 @@ func TestMutationBranchSnapshotsAndUntrackedExclusion(t *testing.T) {
 	}
 }
 func TestMutationTimeoutDoesNotBecomeKilled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping mutation test-suite timeout integration in short mode")
+	}
 	d, _ := mkRepo(t)
 	writeMutationFixture(t, d, "package app\nfunc F(x int)bool{return x<2}\n", "package app\nimport (\"testing\";\"time\")\nfunc TestSlow(t *testing.T){time.Sleep(2*time.Second)}\n")
 	r := runMutationTests(context.Background(), "all", gitCmd(t, d, "rev-parse", "HEAD"), nil, d, 2, 100*time.Millisecond, 10*time.Second, privateTempDir(t), nil, nil, nil)
@@ -275,6 +287,9 @@ func TestMutationTimeoutDoesNotBecomeKilled(t *testing.T) {
 	}
 }
 func TestMutationTotalTimeoutStopsExecution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping mutation test-suite total-timeout integration in short mode")
+	}
 	d, _ := mkRepo(t)
 	writeMutationFixture(t, d, "package app\nfunc F(x int)bool{return x<2 && x>0}\n", "package app\nimport (\"testing\";\"time\")\nfunc TestSlowTotal(t *testing.T){time.Sleep(3*time.Second)}\n")
 	r := runMutationTests(context.Background(), "all", gitCmd(t, d, "rev-parse", "HEAD"), nil, d, 8, 10*time.Second, 5*time.Second, privateTempDir(t), nil, nil, nil)

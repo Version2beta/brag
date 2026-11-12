@@ -16,6 +16,9 @@ import (
 )
 
 func TestSignalCancellationReportsAndExits(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping signal cancellation test-suite integration in short mode")
+	}
 	root, _ := mkRepo(t)
 	ready := filepath.Join(t.TempDir(), "ready")
 	source := fmt.Sprintf(`package app
@@ -30,7 +33,7 @@ func TestWait(t *testing.T) {
 	}
 	gitCmd(t, root, "add", "app_test.go")
 	artifacts := privateTempDir(t)
-	cmd := exec.Command(binary, "all", "--dynamic-tests", "--dynamic-artifacts", artifacts)
+	cmd := exec.Command(binary, "all", "--dynamic-tests", "--expected-root", root, "--dynamic-artifacts", artifacts)
 	cmd.Dir = root
 	cmd.Env = env(root)
 	var stdout, stderr bytes.Buffer
@@ -78,6 +81,9 @@ func TestWait(t *testing.T) {
 }
 
 func TestDynamicCancellationKillsDescendantProcesses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping descendant-process test-suite integration in short mode")
+	}
 	root, _ := mkRepo(t)
 	ready := filepath.Join(t.TempDir(), "ready")
 	survived := filepath.Join(t.TempDir(), "survived")

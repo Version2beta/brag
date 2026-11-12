@@ -12,9 +12,10 @@ type schemaDocument struct {
 	Properties map[string]json.RawMessage `json:"properties"`
 	Required   []string                   `json:"required"`
 	Defs       map[string]struct {
-		Required          []string                   `json:"required"`
-		Properties        map[string]json.RawMessage `json:"properties"`
-		DependentRequired map[string][]string        `json:"dependentRequired"`
+		Required             []string                   `json:"required"`
+		Properties           map[string]json.RawMessage `json:"properties"`
+		DependentRequired    map[string][]string        `json:"dependentRequired"`
+		AdditionalProperties json.RawMessage            `json:"additionalProperties"`
 	} `json:"$defs"`
 }
 
@@ -228,6 +229,52 @@ func TestV6SchemaDeclaresOptInContributionComparison(t *testing.T) {
 	}
 	if _, old := cohort.Properties["additional_detected"]; old {
 		t.Fatal("ambiguous additional_detected remains in v6 comparison")
+	}
+}
+
+func TestV7SchemaRequiresPairedComparisonFields(t *testing.T) {
+	v6 := readSchema(t, "brag-v6.schema.json")
+	if _, exists := v6.Defs["test_contribution_comparison"].Properties["paired_comparison"]; exists {
+		t.Fatal("v6 comparison contract must remain unchanged")
+	}
+	schema := readSchema(t, "brag-v7.schema.json")
+	var version struct {
+		Const int `json:"const"`
+	}
+	if json.Unmarshal(schema.Properties["schema_version"], &version) != nil || version.Const != 7 {
+		t.Fatalf("v7 version=%d", version.Const)
+	}
+	comparison := schema.Defs["test_contribution_comparison"]
+	var allowAdditional bool
+	if !hasField(comparison.Required, "paired_comparison") || json.Unmarshal(comparison.AdditionalProperties, &allowAdditional) != nil || allowAdditional {
+		t.Fatal("v7 must require a strict paired-comparison extension")
+	}
+	paired := schema.Defs["paired_comparison"]
+	for _, field := range []string{"status", "complete_mutation_denominator_unit", "eligible_mutation_ids", "selected_mutation_ids", "paired_mutation_ids", "omitted_mutation_ids", "omission_reasons", "complete_mutation_denominator", "selected_only_detected", "other_only_detected", "both_detected", "neither_detected"} {
+		if !hasField(paired.Required, field) {
+			t.Errorf("v7 paired comparison must require %s", field)
+		}
+	}
+	var status struct {
+		Enum []string `json:"enum"`
+	}
+	if err := json.Unmarshal(paired.Properties["status"], &status); err != nil || !hasField(status.Enum, "inconclusive") {
+		t.Fatal("v7 paired status must distinguish inconclusive persistence")
+	}
+	var denominator struct {
+		OneOf []struct {
+			Type string `json:"type"`
+		} `json:"oneOf"`
+	}
+	if err := json.Unmarshal(paired.Properties["complete_mutation_denominator"], &denominator); err != nil {
+		t.Fatal(err)
+	}
+	nullable := false
+	for _, option := range denominator.OneOf {
+		nullable = nullable || option.Type == "null"
+	}
+	if !nullable {
+		t.Fatal("v7 paired denominator must allow null when unavailable")
 	}
 }
 

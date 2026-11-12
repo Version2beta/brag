@@ -26,7 +26,36 @@ func TestMain(m *testing.M) {
 	os.Remove(binary)
 	os.Exit(code)
 }
+func TestStaticCommandsDoNotExecuteTests(t *testing.T) {
+	d, base := mkRepo(t)
+	marker := filepath.Join(t.TempDir(), "fixture-test-executed")
+	source := fmt.Sprintf("package app\nimport (\"os\"; \"testing\")\nfunc TestMarker(t *testing.T) { if err := os.WriteFile(%q, []byte(\"ran\"), 0600); err != nil { t.Fatal(err) } }\n", marker)
+	writeMutationFixture(t, d, "package app\nfunc Work() int { return 1 }\n", source)
+	for _, scope := range []string{"branch", "all"} {
+		t.Run(scope, func(t *testing.T) {
+			args := []string{"all"}
+			if scope == "branch" {
+				args = []string{"--base", base}
+			}
+			out, err := run(t, d, args...)
+			if err != nil {
+				t.Fatalf("static command: %v\n%s", err, out)
+			}
+			got := decode(t, out)
+			if got.SchemaVersion != reportSchemaVersion || got.DynamicTests != nil || got.MutationTests != nil || got.TestContributions != nil || got.TestContributionComparison != nil {
+				t.Fatal("static report unexpectedly contains execution evidence")
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("static command executed the analyzed test fixture: %v", err)
+			}
+		})
+	}
+}
+
 func TestDynamicTestsAreExplicitlyOptIn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping dynamic test-suite execution in short mode")
+	}
 	d, base := mkRepo(t)
 	os.WriteFile(filepath.Join(d, "go.mod"), []byte("module example.test/dynamic\n\ngo 1.22\n"), 0600)
 	os.WriteFile(filepath.Join(d, "app.go"), []byte("package app\nfunc Work() int { return 1 }\n"), 0600)
@@ -154,28 +183,33 @@ func TestDynamicEventsAndCoverageDenominators(t *testing.T) {
 }
 
 func TestDynamicTimeoutAndOutputCap(t *testing.T) {
-	d, _ := mkRepo(t)
-	src := `package app
+	t.Run("timeout", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping dynamic test-suite timeout integration in short mode")
+		}
+		d, _ := mkRepo(t)
+		src := `package app
 import ("testing"; "time")
 func TestWait(t *testing.T) { time.Sleep(5*time.Second) }
 `
-	os.WriteFile(filepath.Join(d, "app_test.go"), []byte(src), 0600)
-	gitCmd(t, d, "add", "app_test.go")
-	dir, identity, err := materializeDynamicSnapshot(d, snapshotSpec{label: "timeout", overlay: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	r := executeDynamic(context.Background(), dir, privateTempDir(t), "timeout", identity, 100*time.Millisecond, 0, &artifactBudget{})
-	if r.Status != "timeout" || r.Classification != "run_timeout" {
-		t.Fatalf("per-run timeout not reported: %+v", r)
-	}
-	totalCtx, cancelTotal := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
-	totalTimeout := executeDynamic(totalCtx, dir, privateTempDir(t), "total-timeout", identity, 10*time.Second, 0, &artifactBudget{})
-	cancelTotal()
-	if totalTimeout.Status != "timeout" || totalTimeout.Classification != "total_timeout" || totalTimeout.Coverage.Status != "unavailable" {
-		t.Fatalf("total timeout without coverage artifact not reported: %+v", totalTimeout)
-	}
+		os.WriteFile(filepath.Join(d, "app_test.go"), []byte(src), 0600)
+		gitCmd(t, d, "add", "app_test.go")
+		dir, identity, err := materializeDynamicSnapshot(d, snapshotSpec{label: "timeout", overlay: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(dir)
+		r := executeDynamic(context.Background(), dir, privateTempDir(t), "timeout", identity, 100*time.Millisecond, 0, &artifactBudget{})
+		if r.Status != "timeout" || r.Classification != "run_timeout" {
+			t.Fatalf("per-run timeout not reported: %+v", r)
+		}
+		totalCtx, cancelTotal := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+		totalTimeout := executeDynamic(totalCtx, dir, privateTempDir(t), "total-timeout", identity, 10*time.Second, 0, &artifactBudget{})
+		cancelTotal()
+		if totalTimeout.Status != "timeout" || totalTimeout.Classification != "total_timeout" || totalTimeout.Coverage.Status != "unavailable" {
+			t.Fatalf("total timeout without coverage artifact not reported: %+v", totalTimeout)
+		}
+	})
 	exact := &cappedOutput{limit: 4}
 	_, _ = exact.Write([]byte("1234"))
 	if exact.truncated || exact.String() != "1234" {
@@ -228,6 +262,9 @@ func TestDynamicAllUnbornHeadIsUnavailable(t *testing.T) {
 }
 
 func TestDynamicFailSkipCompileAndDependencyOutcomes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping dynamic test-suite outcome integration in short mode")
+	}
 	d, _ := mkRepo(t)
 	artifacts := privateTempDir(t)
 	src := `package app
@@ -297,6 +334,9 @@ func runFixtureDynamic(t *testing.T, root, artifacts string) dynamicRun {
 }
 
 func TestBranchPackageCoverageComparisonRequiresExactUnits(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping repeated branch coverage test-suite execution in short mode")
+	}
 	d, _ := mkRepo(t)
 	os.WriteFile(filepath.Join(d, "go.mod"), []byte(`module example.test/cov
 
@@ -368,6 +408,9 @@ func TestPackageCoverageComparisonPreservesAddedAndRemovedDenominators(t *testin
 }
 
 func TestRepeatedPerTestOutcomeInstability(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping repeated test-suite execution in short mode")
+	}
 	d, _ := mkRepo(t)
 	os.WriteFile(filepath.Join(d, "app_test.go"), []byte(`package app
 import("os";"testing")
@@ -477,11 +520,29 @@ func gitCmd(t *testing.T, dir string, args ...string) string {
 }
 func run(t *testing.T, dir string, args ...string) (string, error) {
 	t.Helper()
+	needsRoot, hasRoot := false, false
+	for _, arg := range args {
+		if arg == "--dynamic-tests" || arg == "--mutation-tests" {
+			needsRoot = true
+		}
+		if arg == "--expected-root" {
+			hasRoot = true
+		}
+	}
+	if needsRoot && !hasRoot {
+		expectedRoot := gitCmd(t, dir, "rev-parse", "--show-toplevel")
+		args = append(args, "--expected-root", expectedRoot)
+	}
 	c := exec.Command(binary, args...)
 	c.Dir = dir
 	c.Env = env(dir)
-	b, e := c.CombinedOutput()
-	return string(b), e
+	var stdout, stderr strings.Builder
+	c.Stdout, c.Stderr = &stdout, &stderr
+	e := c.Run()
+	if e == nil {
+		return stdout.String(), nil
+	}
+	return stdout.String() + stderr.String(), e
 }
 func mkRepo(t *testing.T) (string, string) {
 	t.Helper()

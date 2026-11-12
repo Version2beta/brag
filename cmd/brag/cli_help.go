@@ -32,6 +32,7 @@ func printMainHelp(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Default analysis is static, read-only, and offline. JSON is written to stdout. Tests are inventoried, not run.")
 	fmt.Fprintln(w, "Optional execution modes (Go tests run unsandboxed with host privileges):")
+	fmt.Fprintln(w, "  --expected-root PATH              Required with dynamic or mutation execution; guards against accidental targets")
 	fmt.Fprintln(w, "  --dynamic-tests [--dynamic-repeat 1..3] [--dynamic-timeout D] [--dynamic-total-timeout D] [--dynamic-artifacts DIR]")
 	fmt.Fprintln(w, "  --mutation-tests [--mutation-limit 1..50] [--mutation-package PATH] [--mutation-path PATH] [--mutation-snapshot NAME]")
 	fmt.Fprintln(w, "  --test-contributions             Requires --mutation-tests; experimental, bounded execution")
